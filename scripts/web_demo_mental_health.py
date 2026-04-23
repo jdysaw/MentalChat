@@ -7,9 +7,14 @@ import json
 import os
 import sys
 import time
+import torch
+import warnings
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+warnings.filterwarnings('ignore')
 
 # 危机干预关键词
 CRISIS_KEYWORDS = ['自杀', '自残', '不想活', '活着没意思', '伤害自己', 
@@ -65,12 +70,122 @@ def display_crisis_banner():
         """
     )
 
+@st.cache_resource
+def load_model():
+    """加载Qwen-1.8B心理健康模型"""
+    import locale
+    if hasattr(locale, 'setlocale'):
+        try:
+            locale.setlocale(locale.LC_ALL, '')
+        except:
+            pass
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Qwen模型路径
+    model_path = 'D:/models/Qwen1.5-1.8B-Chat'
+    
+    if not os.path.exists(model_path):
+        print(f"[ERROR] Model not found: {model_path}")
+        return None, None, None
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        print(f"[OK] Tokenizer loaded")
+    except Exception as e:
+        print(f"[ERROR] Tokenizer failed: {e}")
+        return None, None, None
+    
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map='auto',
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True
+        )
+        print(f"[OK] Qwen-1.8B model loaded")
+    except Exception as e:
+        print(f"[ERROR] Model failed: {e}")
+        return None, None, None
+    
+    # 测试推理
+    try:
+        test_input = tokenizer("你好", return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            output = model.generate(**test_input, max_new_tokens=10)
+        print(f"[OK] Inference test passed")
+    except Exception as e:
+        print(f"[ERROR] Inference failed: {e}")
+        return None, None, None
+    
+    return model, tokenizer, device
+
+
+def generate_response(model, tokenizer, device, user_input, history=None, max_new_tokens=512, temperature=0.7, top_p=0.9):
+    """使用Qwen模型生成心理健康回复"""
+    if history is None:
+        history = []
+    
+    conversation = history.copy()
+    conversation.append({"role": "user", "content": user_input})
+    
+    try:
+        text = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    except Exception as e:
+        print(f"[ERROR] Tokenization failed: {e}")
+        return "抱歉，我无法处理这个输入。请尝试重新提问。"
+    
+    try:
+        with torch.no_grad():
+            generated_ids = model.generate(
+                inputs.input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=1.1,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(
+            generated_ids[0][len(inputs.input_ids[0]):],
+            skip_special_tokens=True
+        )
+        
+        return response if response.strip() else "抱歉，我无法生成回复。请尝试换个方式提问。"
+    except Exception as e:
+        print(f"[ERROR] Generation failed: {e}")
+        return "抱歉，生成回复时出错。请尝试重新提问。"
+
+
 def main():
     st.set_page_config(
         page_title="心理健康助手",
         page_icon="🧠",
         layout="wide"
     )
+    
+    # 初始化聊天状态（必须在侧边栏之前初始化）
+    init_chat_state()
+    
+    # 初始化历史对话状态
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    
+    # 加载模型
+    with st.spinner("正在加载模型..."):
+        try:
+            model, tokenizer, device = load_model()
+            st.success(f"✓ 模型加载成功 (设备: {device})")
+        except Exception as e:
+            st.error(f"✗ 模型加载失败: {e}")
+            st.info("将使用模拟回复模式")
+            model, tokenizer, device = None, None, None
     
     # 标题
     st.title("🧠 心理健康助手")
@@ -93,9 +208,6 @@ def main():
         st.markdown("---")
         st.header("📊 使用统计")
         st.metric("对话轮数", len(st.session_state.messages) // 2)
-    
-    # 初始化聊天状态
-    init_chat_state()
     
     # 显示危机干预横幅
     if st.session_state.crisis_detected:
@@ -130,12 +242,27 @@ def main():
             st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # TODO: 这里应该调用 MiniMind 模型生成回复
-        # 由于当前环境没有 GPU，这里使用模拟回复
+        # 使用模型生成回复
         with st.chat_message("assistant"):
-            # 模拟模型回复（实际使用时替换为真实模型调用）
-            response = simulate_mental_health_response(prompt)
-            st.markdown(response)
+            with st.spinner("正在思考..."):
+                if model is not None:
+                    # 使用真实模型
+                    response = generate_response(
+                        model, tokenizer, device,
+                        prompt,
+                        history=st.session_state.history,
+                        max_new_tokens=200,  # 减少输出长度，避免生成过长无意义内容
+                        temperature=0.7,     # 降低温度，提高稳定性
+                        top_p=0.9            # 提高top_p，增加多样性
+                    )
+                    # 更新历史
+                    st.session_state.history.append({"role": "user", "content": prompt})
+                    st.session_state.history.append({"role": "assistant", "content": response})
+                else:
+                    # 使用模拟回复
+                    response = simulate_mental_health_response(prompt)
+                
+                st.markdown(response)
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()
