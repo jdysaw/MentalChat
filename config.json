@@ -1,0 +1,7 @@
+{
+    "base_model_path": "D:/models/Qwen1.5-1.8B-Chat",
+    "lora_path": "",
+    "max_new_tokens": 200,
+    "temperature": 0.5,
+    "top_p": 0.85
+}

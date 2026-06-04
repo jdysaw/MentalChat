@@ -17,6 +17,32 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 warnings.filterwarnings('ignore')
 
+# 配置文件路径
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
+
+def load_config():
+    """从 config.json 读取配置"""
+    default_config = {
+        "base_model_path": "D:/models/Qwen1.5-1.8B-Chat",
+        "lora_path": "",
+        "max_new_tokens": 200,
+        "temperature": 0.5,
+        "top_p": 0.85
+    }
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+                default_config.update(saved)
+        except Exception:
+            pass
+    return default_config
+
+def save_config(config):
+    """保存配置到 config.json"""
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
+
 # 危机干预关键词
 CRISIS_KEYWORDS = ['自杀', '自残', '不想活', '活着没意思', '伤害自己', 
                    '结束生命', '跳楼', '割腕', '死掉', '不想活了']
@@ -72,59 +98,76 @@ def display_crisis_banner():
     )
 
 @st.cache_resource
-def load_model():
+def load_model(_base_model_path, _lora_path):
     """加载Qwen-1.8B心理健康模型 + LoRA微调权重"""
     import locale
+    import psutil
     if hasattr(locale, 'setlocale'):
         try:
             locale.setlocale(locale.LC_ALL, '')
         except:
             pass
-    
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Qwen基础模型路径
-    base_model_path = 'D:/models/Qwen1.5-1.8B-Chat'
-    # LoRA微调权重路径
-    lora_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'trainer', 'qwen_lora_5k')
-    
+
     # 检查模型路径是否存在
-    if not os.path.exists(base_model_path):
-        print(f"[INFO] Base model not found: {base_model_path}")
+    if not os.path.exists(_base_model_path):
+        print(f"[INFO] Base model not found: {_base_model_path}")
         print(f"[INFO] Will use simulation mode")
         return None, None, None
-    
+
+    # 检查可用内存（CPU 模式下至少需要 4GB 可用内存）
+    available_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
+    if device == 'cpu' and available_mem_gb < 4:
+        print(f"[WARNING] Available RAM only {available_mem_gb:.1f}GB, need >= 4GB for model loading")
+        return None, None, "low_memory"
+
+    # 如果配置了自定义 LoRA 路径则使用，否则用默认路径
+    if _lora_path and os.path.exists(_lora_path):
+        lora_path = _lora_path
+    else:
+        lora_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'trainer', 'qwen_lora_5k')
+
     if not os.path.exists(lora_path):
         print(f"[WARNING] LoRA weights not found: {lora_path}, using base model only")
         lora_path = None
-    
+
     try:
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(_base_model_path, trust_remote_code=True)
         print(f"[OK] Tokenizer loaded")
     except Exception as e:
         print(f"[ERROR] Tokenizer failed: {e}")
         return None, None, None
-    
+
     try:
-        # 加载基础模型
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_path,
-            device_map='auto',
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            trust_remote_code=True
-        )
-        
+        # 加载基础模型，使用float16和低内存配置
+        load_kwargs = {
+            "trust_remote_code": True,
+            "device_map": "auto",
+        }
+        if device == "cuda":
+            # 使用float16和低内存优化
+            load_kwargs["torch_dtype"] = torch.float16
+            load_kwargs["low_cpu_mem_usage"] = True
+            print("[INFO] 使用float16和低内存优化加载模型")
+        else:
+            # CPU 模式：使用 float32 但启用低内存优化
+            load_kwargs["torch_dtype"] = torch.float32
+            load_kwargs["low_cpu_mem_usage"] = True
+
+        model = AutoModelForCausalLM.from_pretrained(_base_model_path, **load_kwargs)
+
         # 如果存在LoRA权重，加载微调权重
         if lora_path and os.path.exists(os.path.join(lora_path, 'adapter_model.safetensors')):
             print(f"[OK] Loading LoRA weights from: {lora_path}")
             model = PeftModel.from_pretrained(model, lora_path)
             print(f"[OK] LoRA weights loaded successfully")
-        
-        print(f"[OK] Qwen-1.8B model loaded")
+
+        print(f"[OK] Qwen-1.8B model loaded on {device}")
     except Exception as e:
         print(f"[ERROR] Model failed: {e}")
         return None, None, None
-    
+
     # 测试推理
     try:
         test_input = tokenizer("你好", return_tensors="pt").to(model.device)
@@ -134,7 +177,7 @@ def load_model():
     except Exception as e:
         print(f"[ERROR] Inference failed: {e}")
         return None, None, None
-    
+
     return model, tokenizer, device
 
 
@@ -191,19 +234,46 @@ def main():
         page_icon="🧠",
         layout="wide"
     )
-    
+
     # 初始化聊天状态（必须在侧边栏之前初始化）
     init_chat_state()
-    
+
     # 初始化历史对话状态
     if "history" not in st.session_state:
         st.session_state.history = []
-    
+
+    # 读取配置
+    config = load_config()
+
+    # 侧边栏 - 模型配置
+    with st.sidebar:
+        st.header("⚙️ 模型配置")
+        with st.expander("模型路径设置", expanded=not os.path.exists(config["base_model_path"])):
+            new_base_path = st.text_input("基础模型路径", value=config["base_model_path"])
+            new_lora_path = st.text_input("LoRA 权重路径（留空使用默认）", value=config.get("lora_path", ""))
+            if st.button("💾 保存配置并重新加载"):
+                config["base_model_path"] = new_base_path
+                config["lora_path"] = new_lora_path
+                save_config(config)
+                st.cache_resource.clear()
+                st.success("配置已保存，正在重新加载模型...")
+                st.rerun()
+
+        st.markdown("---")
+
     # 加载模型
     with st.spinner("正在加载模型..."):
         try:
-            model, tokenizer, device = load_model()
-            st.success(f"✓ 模型加载成功 (设备: {device})")
+            model, tokenizer, device = load_model(config["base_model_path"], config.get("lora_path", ""))
+            if model is not None:
+                st.success(f"✓ 模型加载成功 (设备: {device})")
+            elif device == "low_memory":
+                import psutil
+                avail = psutil.virtual_memory().available / (1024 ** 3)
+                st.error(f"✗ 内存不足：当前可用 {avail:.1f}GB，加载模型至少需要 4GB 可用内存")
+                st.info("请关闭其他程序释放内存后重试，或使用模拟回复模式")
+            else:
+                st.warning("⚠️ 未找到本地模型，将使用模拟回复模式")
         except Exception as e:
             st.error(f"✗ 模型加载失败: {e}")
             st.info("将使用模拟回复模式")
