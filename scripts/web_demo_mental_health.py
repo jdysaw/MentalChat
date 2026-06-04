@@ -97,9 +97,9 @@ def display_crisis_banner():
         """
     )
 
-@st.cache_resource
-def load_model(_base_model_path, _lora_path):
-    """加载Qwen-1.8B心理健康模型 + LoRA微调权重"""
+@st.cache_resource(max_entries=1, ttl=3600, show_spinner=False)
+def load_model_cached(_base_model_path, _lora_path):
+    """加载Qwen-1.8B心理健康模型 + LoRA微调权重（纯加载，无回调，用于缓存）"""
     import locale
     import psutil
     if hasattr(locale, 'setlocale'):
@@ -110,72 +110,60 @@ def load_model(_base_model_path, _lora_path):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 检查模型路径是否存在
     if not os.path.exists(_base_model_path):
         print(f"[INFO] Base model not found: {_base_model_path}")
-        print(f"[INFO] Will use simulation mode")
-        return None, None, None
+        return None, None, "not_found"
 
-    # 检查可用内存（CPU 模式下至少需要 4GB 可用内存）
     available_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
     if device == 'cpu' and available_mem_gb < 4:
-        print(f"[WARNING] Available RAM only {available_mem_gb:.1f}GB, need >= 4GB for model loading")
+        print(f"[WARNING] Available RAM only {available_mem_gb:.1f}GB")
         return None, None, "low_memory"
 
-    # 如果配置了自定义 LoRA 路径则使用，否则用默认路径
+    # 确定 LoRA 路径
     if _lora_path and os.path.exists(_lora_path):
         lora_path = _lora_path
     else:
         lora_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'trainer', 'qwen_lora_5k')
-
     if not os.path.exists(lora_path):
-        print(f"[WARNING] LoRA weights not found: {lora_path}, using base model only")
         lora_path = None
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(_base_model_path, trust_remote_code=True)
         print(f"[OK] Tokenizer loaded")
     except Exception as e:
-        print(f"[ERROR] Tokenizer failed: {e}")
+        print(f"[ERROR] Tokenizer: {e}")
         return None, None, None
 
     try:
-        # 加载基础模型，使用float16和低内存配置
         load_kwargs = {
             "trust_remote_code": True,
             "device_map": "auto",
         }
         if device == "cuda":
-            # 使用float16和低内存优化
             load_kwargs["torch_dtype"] = torch.float16
             load_kwargs["low_cpu_mem_usage"] = True
-            print("[INFO] 使用float16和低内存优化加载模型")
         else:
-            # CPU 模式：使用 float32 但启用低内存优化
             load_kwargs["torch_dtype"] = torch.float32
             load_kwargs["low_cpu_mem_usage"] = True
 
         model = AutoModelForCausalLM.from_pretrained(_base_model_path, **load_kwargs)
 
-        # 如果存在LoRA权重，加载微调权重
         if lora_path and os.path.exists(os.path.join(lora_path, 'adapter_model.safetensors')):
-            print(f"[OK] Loading LoRA weights from: {lora_path}")
+            print(f"[OK] Loading LoRA from: {lora_path}")
             model = PeftModel.from_pretrained(model, lora_path)
-            print(f"[OK] LoRA weights loaded successfully")
 
         print(f"[OK] Qwen-1.8B model loaded on {device}")
     except Exception as e:
-        print(f"[ERROR] Model failed: {e}")
+        print(f"[ERROR] Model: {e}")
         return None, None, None
 
-    # 测试推理
     try:
         test_input = tokenizer("你好", return_tensors="pt").to(model.device)
         with torch.no_grad():
             output = model.generate(**test_input, max_new_tokens=10)
         print(f"[OK] Inference test passed")
     except Exception as e:
-        print(f"[ERROR] Inference failed: {e}")
+        print(f"[ERROR] Inference: {e}")
         return None, None, None
 
     return model, tokenizer, device
@@ -235,76 +223,147 @@ def main():
         layout="wide"
     )
 
-    # 初始化聊天状态（必须在侧边栏之前初始化）
+    # 初始化聊天状态
     init_chat_state()
 
     # 初始化历史对话状态
     if "history" not in st.session_state:
         st.session_state.history = []
 
+    # === 阶段1：检查模型加载状态 ===
+    # 使用 session_state 追踪加载状态，避免每次交互都阻塞
+    if "model_loaded" not in st.session_state:
+        st.session_state.model_loaded = "pending"  # pending / loading / done / failed
+
+    if "model_objects" not in st.session_state:
+        st.session_state.model_objects = (None, None, None)
+
+    if "load_message" not in st.session_state:
+        st.session_state.load_message = ""
+
+    if "load_progress" not in st.session_state:
+        st.session_state.load_progress = 0
+
     # 读取配置
     config = load_config()
 
-    # 侧边栏 - 模型配置
+    # === 阶段2：渲染侧边栏（独立于模型加载） ===
     with st.sidebar:
         st.header("⚙️ 模型配置")
-        with st.expander("模型路径设置", expanded=not os.path.exists(config["base_model_path"])):
+        with st.expander("模型路径设置"):
             new_base_path = st.text_input("基础模型路径", value=config["base_model_path"])
             new_lora_path = st.text_input("LoRA 权重路径（留空使用默认）", value=config.get("lora_path", ""))
-            if st.button("💾 保存配置并重新加载"):
-                config["base_model_path"] = new_base_path
-                config["lora_path"] = new_lora_path
-                save_config(config)
-                st.cache_resource.clear()
-                st.success("配置已保存，正在重新加载模型...")
-                st.rerun()
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 保存配置"):
+                    config["base_model_path"] = new_base_path
+                    config["lora_path"] = new_lora_path
+                    save_config(config)
+                    st.cache_resource.clear()
+                    # 重置加载状态
+                    st.session_state.model_loaded = "pending"
+                    st.session_state.model_objects = (None, None, None)
+                    st.success("配置已保存，刷新页面重新加载")
+            with col2:
+                if st.button("🔄 重新加载"):
+                    st.cache_resource.clear()
+                    st.session_state.model_loaded = "pending"
+                    st.session_state.model_objects = (None, None, None)
+                    st.rerun()
 
         st.markdown("---")
-
-    # 加载模型
-    with st.spinner("正在加载模型..."):
-        try:
-            model, tokenizer, device = load_model(config["base_model_path"], config.get("lora_path", ""))
-            if model is not None:
-                st.success(f"✓ 模型加载成功 (设备: {device})")
-            elif device == "low_memory":
-                import psutil
-                avail = psutil.virtual_memory().available / (1024 ** 3)
-                st.error(f"✗ 内存不足：当前可用 {avail:.1f}GB，加载模型至少需要 4GB 可用内存")
-                st.info("请关闭其他程序释放内存后重试，或使用模拟回复模式")
-            else:
-                st.warning("⚠️ 未找到本地模型，将使用模拟回复模式")
-        except Exception as e:
-            st.error(f"✗ 模型加载失败: {e}")
-            st.info("将使用模拟回复模式")
-            model, tokenizer, device = None, None, None
-    
-    # 标题
-    st.title("🧠 心理健康助手")
-    st.caption("基于 Qwen-1.8B + LoRA 微调 | 本地化部署 | 隐私保护")
-    
-    # 侧边栏 - 危机干预信息
-    with st.sidebar:
         st.header("🆘 危机干预资源")
         for name, phone in CRISIS_HOTLINES.items():
             st.markdown(f"**{name}**\n\n📞 {phone}")
-        
+
         st.markdown("---")
         st.info("""
         ⚠️ **免责声明**
-        
+
         本助手仅供参考，不能替代专业心理咨询。
         如遇紧急情况，请立即联系专业机构。
         """)
-        
+
         st.markdown("---")
         st.header("📊 使用统计")
         st.metric("对话轮数", len(st.session_state.messages) // 2)
         # 显示当前模式
+        model, tokenizer, device = st.session_state.model_objects
         if model is not None:
-            st.success("✅ 模型模式（真实推理）")
+            st.success(f"✅ 模型模式 ({device})")
         else:
             st.warning("⚠️ 模拟模式（关键词回复）")
+
+    # === 阶段3：模型加载（仅在首次进入时阻塞） ===
+    if st.session_state.model_loaded == "pending":
+        st.title("🧠 心理健康助手")
+        st.caption("基于 Qwen-1.8B + LoRA 微调 | 本地化部署 | 隐私保护")
+
+        # 检查是否已缓存（用于显示即时状态）
+        status_placeholder = None
+        try:
+            # 先用状态显示加载进度
+            status_placeholder = st.status("正在加载模型中...请稍候（约 10-20 秒）", expanded=True)
+            progress_bar = status_placeholder.progress(0)
+            msg_text = status_placeholder.empty()
+
+            st.session_state.model_loaded = "loading"
+
+            # 模拟进度（实际缓存在后台完成）
+            phases = [
+                (5, "检查环境..."),
+                (15, "正在加载 Tokenizer..."),
+                (35, f"正在加载模型..."),
+                (70, "正在加载 LoRA 微调权重..."),
+                (85, "进行推理测试..."),
+                (95, "收尾中..."),
+            ]
+            for pct, msg in phases:
+                progress_bar.progress(pct / 100)
+                msg_text.markdown(f"**{msg}**")
+                time.sleep(0.3)
+
+            # 真正的模型加载（走缓存）
+            model, tokenizer, device = load_model_cached(
+                config["base_model_path"],
+                config.get("lora_path", ""),
+            )
+
+            if model is not None:
+                st.session_state.model_objects = (model, tokenizer, device)
+                st.session_state.model_loaded = "done"
+                progress_bar.progress(1.0)
+                msg_text.markdown("**✅ 模型加载成功！**")
+                status_placeholder.update(label="✅ 模型加载成功！", state="complete", expanded=False)
+            elif device == "not_found":
+                st.session_state.model_loaded = "failed"
+                status_placeholder.update(label="⚠️ 未找到本地模型", state="error", expanded=False)
+                status_placeholder.markdown("将使用模拟回复模式。可修改侧边栏的模型路径后刷新重试。")
+            elif device == "low_memory":
+                import psutil
+                avail = psutil.virtual_memory().available / (1024 ** 3)
+                st.session_state.model_loaded = "failed"
+                status_placeholder.update(label=f"❌ 内存不足（可用 {avail:.1f}GB）", state="error", expanded=True)
+                status_placeholder.markdown("请关闭其他程序释放内存后，点击侧边栏「🔄 重新加载」按钮重试。")
+            else:
+                st.session_state.model_loaded = "failed"
+                status_placeholder.update(label="❌ 模型加载失败", state="error", expanded=False)
+                status_placeholder.markdown("转为模拟回复模式。检查模型路径是否正确。")
+        except Exception as e:
+            st.session_state.model_loaded = "failed"
+            st.error(f"加载异常: {e}")
+            if status_placeholder:
+                status_placeholder.update(label=f"❌ 异常: {e}", state="error")
+
+        time.sleep(1)
+        st.rerun()
+
+    # === 阶段4：显示聊天界面 ===
+    model, tokenizer, device = st.session_state.model_objects
+
+    # 标题
+    st.title("🧠 心理健康助手")
+    st.caption("基于 Qwen-1.8B + LoRA 微调 | 本地化部署 | 隐私保护")
     
     # 显示危机干预横幅
     if st.session_state.crisis_detected:
