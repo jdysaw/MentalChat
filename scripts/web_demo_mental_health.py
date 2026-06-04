@@ -10,6 +10,7 @@ import time
 import torch
 import warnings
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+from peft import PeftModel
 
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -72,7 +73,7 @@ def display_crisis_banner():
 
 @st.cache_resource
 def load_model():
-    """加载Qwen-1.8B心理健康模型"""
+    """加载Qwen-1.8B心理健康模型 + LoRA微调权重"""
     import locale
     if hasattr(locale, 'setlocale'):
         try:
@@ -82,27 +83,43 @@ def load_model():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # Qwen模型路径
-    model_path = 'D:/models/Qwen1.5-1.8B-Chat'
+    # Qwen基础模型路径
+    base_model_path = 'D:/models/Qwen1.5-1.8B-Chat'
+    # LoRA微调权重路径
+    lora_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'trainer', 'qwen_lora_5k')
     
-    if not os.path.exists(model_path):
-        print(f"[ERROR] Model not found: {model_path}")
+    # 检查模型路径是否存在
+    if not os.path.exists(base_model_path):
+        print(f"[INFO] Base model not found: {base_model_path}")
+        print(f"[INFO] Will use simulation mode")
         return None, None, None
     
+    if not os.path.exists(lora_path):
+        print(f"[WARNING] LoRA weights not found: {lora_path}, using base model only")
+        lora_path = None
+    
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
         print(f"[OK] Tokenizer loaded")
     except Exception as e:
         print(f"[ERROR] Tokenizer failed: {e}")
         return None, None, None
     
     try:
+        # 加载基础模型
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            base_model_path,
             device_map='auto',
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             trust_remote_code=True
         )
+        
+        # 如果存在LoRA权重，加载微调权重
+        if lora_path and os.path.exists(os.path.join(lora_path, 'adapter_model.safetensors')):
+            print(f"[OK] Loading LoRA weights from: {lora_path}")
+            model = PeftModel.from_pretrained(model, lora_path)
+            print(f"[OK] LoRA weights loaded successfully")
+        
         print(f"[OK] Qwen-1.8B model loaded")
     except Exception as e:
         print(f"[ERROR] Model failed: {e}")
@@ -121,12 +138,16 @@ def load_model():
     return model, tokenizer, device
 
 
-def generate_response(model, tokenizer, device, user_input, history=None, max_new_tokens=512, temperature=0.7, top_p=0.9):
+def generate_response(model, tokenizer, device, user_input, history=None, max_new_tokens=512):
     """使用Qwen模型生成心理健康回复"""
     if history is None:
         history = []
     
-    conversation = history.copy()
+    # 添加 system prompt 引导模型提供更实用的建议
+    system_prompt = "你是一个正常的聊天机器人。回复要简短、直接。不要问用户有什么烦恼，不要假设用户心情不好，不要说'理解你的感受'之类的套话。就像微信聊天一样自然。"
+    
+    conversation = [{"role": "system", "content": system_prompt}]
+    conversation.extend(history)
     conversation.append({"role": "user", "content": user_input})
     
     try:
@@ -144,11 +165,12 @@ def generate_response(model, tokenizer, device, user_input, history=None, max_ne
         with torch.no_grad():
             generated_ids = model.generate(
                 inputs.input_ids,
+                attention_mask=inputs.attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=1.1,
+                temperature=0.5,
+                top_p=0.85,
+                repetition_penalty=1.2,
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -189,7 +211,7 @@ def main():
     
     # 标题
     st.title("🧠 心理健康助手")
-    st.caption("基于 MiniMind 超轻量语言模型 | 本地化部署 | 隐私保护")
+    st.caption("基于 Qwen-1.8B + LoRA 微调 | 本地化部署 | 隐私保护")
     
     # 侧边栏 - 危机干预信息
     with st.sidebar:
@@ -208,6 +230,11 @@ def main():
         st.markdown("---")
         st.header("📊 使用统计")
         st.metric("对话轮数", len(st.session_state.messages) // 2)
+        # 显示当前模式
+        if model is not None:
+            st.success("✅ 模型模式（真实推理）")
+        else:
+            st.warning("⚠️ 模拟模式（关键词回复）")
     
     # 显示危机干预横幅
     if st.session_state.crisis_detected:
@@ -251,43 +278,98 @@ def main():
                         model, tokenizer, device,
                         prompt,
                         history=st.session_state.history,
-                        max_new_tokens=200,  # 减少输出长度，避免生成过长无意义内容
-                        temperature=0.7,     # 降低温度，提高稳定性
-                        top_p=0.9            # 提高top_p，增加多样性
+                        max_new_tokens=200  # 减少输出长度，避免生成过长无意义内容
                     )
                     # 更新历史
                     st.session_state.history.append({"role": "user", "content": prompt})
                     st.session_state.history.append({"role": "assistant", "content": response})
                 else:
                     # 使用模拟回复
-                    response = simulate_mental_health_response(prompt)
+                    response = simulate_mental_health_response(prompt, history=st.session_state.history)
                 
                 st.markdown(response)
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()
 
-def simulate_mental_health_response(user_input):
+def simulate_mental_health_response(user_input, history=None):
     """
-    模拟心理健康助手回复
+    模拟心理健康助手回复（含上下文感知）
     实际使用时应替换为 MiniMind 模型的真实调用
     """
-    # 这里只是一个示例，实际应该调用训练好的模型
-    responses = {
-        "焦虑": "我理解你的焦虑情绪。焦虑是很常见的心理状态。你可以尝试深呼吸练习：吸气4秒，屏住4秒，呼气6秒，重复几次。同时，试着把让你焦虑的事情写下来，分析哪些是可控的，哪些不可控。",
-        "压力": "感到压力是很正常的。我建议你：1）制定合理的计划，把任务分解成小目标；2）保证充足的休息；3）适当运动帮助释放压力。你觉得哪种方法最适合你现在的状况？",
-        "抑郁": "我听到你正在经历困难的时期。持续的情绪低落需要关注。建议你：1）保持规律作息；2）适当运动；3）和信任的人倾诉。如果这种情况持续两周以上，建议寻求专业心理咨询师的帮助。",
-        "失眠": "睡眠问题确实很困扰人。你可以尝试：1）建立规律的作息时间；2）睡前1小时避免使用电子设备；3）睡前做些放松活动，如热水澡或轻音乐。",
-        "孤独": "孤独感是很正常的情感体验。建立联系需要时间，你可以：1）参加感兴趣的社团或活动；2）主动和同学交流；3）做一个好的倾听者。慢慢来，友谊是慢慢建立的。",
+    import random
+
+    # 扩展关键词库，分组匹配
+    keyword_groups = {
+        "焦虑": [
+            "我理解你的焦虑情绪。焦虑是很常见的心理状态。你可以尝试深呼吸练习：吸气4秒，屏住4秒，呼气6秒，重复几次。试着把让你焦虑的事情写下来，分析哪些是可控的。",
+            '面对焦虑时，试试「5-4-3-2-1」grounding技巧：说出5样看到的东西、4样摸到的、3样听到的、2样闻到的、1样尝到的。你感觉怎么样？',
+            "焦虑往往来自于对未来的不确定。把注意力拉回当下，关注此刻你能做的事。有什么具体的事情在困扰你吗？",
+        ],
+        "压力": [
+            "感到压力是很正常的。我建议：1）把任务分解成小目标；2）保证充足休息；3）适当运动释放压力。你觉得哪种方法适合你？",
+            "压力大的时候，试试番茄工作法：专注25分钟，休息5分钟。记得给自己留出放松的时间。",
+            "工作/学习压力大的时候，看看能不能调整期望值——不需要每件事都做到完美。你能说说什么让你最感压力吗？",
+        ],
+        "抑郁": [
+            "持续的情绪低落需要关注。建议：1）保持规律作息；2）适当运动；3）和信任的人倾诉。如果持续两周以上，建议寻求专业帮助。",
+            "情绪低落时，试着做一件小事——整理桌面、散步10分钟、听一首喜欢的歌。小行动有时能带来变化。",
+            "你愿意和我多聊聊最近发生了什么吗？有时候说出来本身就是一种释放。",
+        ],
+        "失眠": [
+            "睡眠问题确实困扰人。可以尝试：1）固定作息时间；2）睡前1小时远离电子设备；3）做些放松活动如热水澡或轻音乐。",
+            '睡不好时，试试「478呼吸法」：吸气4秒，屏气7秒，呼气8秒，重复几次。这能帮身体放松下来。',
+            "如果躺了20分钟还睡不着，建议起床做点轻松的事（如看书），等有困意再上床。不要在床上焦虑。",
+        ],
+        "孤独": [
+            "孤独感是很正常的情感体验。可以试试：1）参加感兴趣的社团或活动；2）主动和同学交流；3）做一个好的倾听者。友谊是慢慢建立的。",
+            "感到孤独的时候，给家人或老朋友发条消息吧。有时候主动迈出第一步，会发现对方也在等你联系。",
+            "独处和孤独不一样——独处可以是一种享受。如果感到孤独，可以试着养个爱好，或者参与一些线上社群活动。",
+        ],
+        "你好": [
+            "你好！今天过得怎么样？有什么想聊聊的吗？",
+            "嗨！有什么我可以帮你的吗？或者随便聊聊也行～",
+            "你好呀！最近怎么样？",
+        ],
+        "谢谢": [
+            "不客气！有什么随时找我聊～",
+            "没事的，我在这儿陪着呢。",
+            "不用谢～希望你的心情好一点了！",
+        ],
+        "生气|愤怒|烦躁|烦": [
+            "生气是正常的情绪，重要的是怎么处理它。试试深呼吸，给自己10秒钟冷静一下。",
+            "听起来你今天遇到了一些烦心事。要不要说说发生了什么？有时候说出来气就消了一半。",
+        ],
+        "考试|学习|复习": [
+            "学习压力大是正常的。试试制定一个合理的复习计划，劳逸结合。你现在的复习进度怎么样？",
+            "考试期间记得照顾好自己：按时吃饭、保证睡眠、适当运动。效率比时间更重要。",
+        ],
+        "朋友|同学|室友": [
+            "人际关系有时确实让人困扰。能具体说说发生了什么吗？我们可以一起想想办法。",
+            "处理人际关系最重要的是沟通。试试坦诚地表达你的感受，同时也要倾听对方的想法。",
+        ],
+        "累|疲惫|没精神": [
+            "累了就休息一下吧。身体是革命的本钱，适当的休息才能走更远的路。",
+            "持续疲惫可能说明你需要调整一下生活节奏。有没有什么你可以暂时放下的任务？",
+        ],
     }
-    
-    # 简单的关键词匹配
-    for keyword, response in responses.items():
-        if keyword in user_input:
-            return response
-    
-    # 默认回复
-    return "感谢你的分享。我在这里倾听你，并尽力提供支持。你能再多告诉我一些你的感受吗？了解更多信息可以帮助我更好地理解你的情况。"
+
+    # 遍历关键词组进行匹配
+    for keywords, responses in keyword_groups.items():
+        for kw in keywords.split("|"):
+            if kw in user_input:
+                return random.choice(responses)
+
+    # 多个不同的默认回复，增加多样性
+    default_responses = [
+        "嗯，我在听。你想说什么都可以，不需要顾虑。",
+        "谢谢你的分享。能多说一点吗？我想更好地理解你的情况。",
+        "我明白你的意思了。你对此有什么感觉？",
+        "嗯，继续说说你的想法吧，我在这儿听着。",
+        "听起来这对你来说挺重要的。能展开讲讲吗？",
+        "我理解。有时候把话说出来，心里就会轻松一些。",
+    ]
+    return random.choice(default_responses)
 
 if __name__ == "__main__":
     main()
