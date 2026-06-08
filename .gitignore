@@ -2,3 +2,13 @@ model/__pycache__
 out
 website/
 docs-minimind/
+
+# 本地大模型和微调权重
+models/
+checkpoints/
+checkpoints_new/
+
+# Python 缓存和临时文件
+__pycache__/
+*.pyc
+.files/

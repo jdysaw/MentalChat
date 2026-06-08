@@ -9,7 +9,8 @@ import sys
 import time
 import torch
 import warnings
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+from threading import Thread
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer, TextIteratorStreamer
 from peft import PeftModel
 
 # 添加项目路径
@@ -99,7 +100,7 @@ def display_crisis_banner():
 
 @st.cache_resource(max_entries=1, ttl=3600, show_spinner=False)
 def load_model_cached(_base_model_path, _lora_path):
-    """加载Qwen-1.8B心理健康模型 + LoRA微调权重（纯加载，无回调，用于缓存）"""
+    """加载Qwen-1.8B心理健康模型 + LoRA微调权重（若失败则尝试探测并降级到 Ollama）"""
     import locale
     import psutil
     if hasattr(locale, 'setlocale'):
@@ -110,13 +111,37 @@ def load_model_cached(_base_model_path, _lora_path):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if not os.path.exists(_base_model_path):
-        print(f"[INFO] Base model not found: {_base_model_path}")
+    # 如果 _base_model_path 不存在，尝试探测本地 Ollama
+    if not _base_model_path or not os.path.exists(_base_model_path):
+        print(f"[INFO] Base model path not found: {_base_model_path}")
+        print("[INFO] Falling back to check Ollama service...")
+        try:
+            import requests
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                models = [m['name'] for m in resp.json().get('models', [])]
+                if "gemma4:e2b" in models or len(models) > 0:
+                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
+                    print(f"[OK] Ollama detected. Using model: {target_model}")
+                    return "ollama", target_model, "localhost (Ollama API)"
+        except Exception as e:
+            print(f"[INFO] Ollama connection failed: {e}")
         return None, None, "not_found"
 
     available_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
     if device == 'cpu' and available_mem_gb < 4:
         print(f"[WARNING] Available RAM only {available_mem_gb:.1f}GB")
+        # 内存不足也尝试探测下 Ollama
+        try:
+            import requests
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                models = [m['name'] for m in resp.json().get('models', [])]
+                if len(models) > 0:
+                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
+                    return "ollama", target_model, "localhost (Ollama API)"
+        except:
+            pass
         return None, None, "low_memory"
 
     # 确定 LoRA 路径
@@ -131,7 +156,18 @@ def load_model_cached(_base_model_path, _lora_path):
         tokenizer = AutoTokenizer.from_pretrained(_base_model_path, trust_remote_code=True)
         print(f"[OK] Tokenizer loaded")
     except Exception as e:
-        print(f"[ERROR] Tokenizer: {e}")
+        print(f"[ERROR] Tokenizer failed: {e}")
+        # 尝试探测 Ollama
+        try:
+            import requests
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                models = [m['name'] for m in resp.json().get('models', [])]
+                if len(models) > 0:
+                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
+                    return "ollama", target_model, "localhost (Ollama API)"
+        except:
+            pass
         return None, None, None
 
     try:
@@ -154,7 +190,18 @@ def load_model_cached(_base_model_path, _lora_path):
 
         print(f"[OK] Qwen-1.8B model loaded on {device}")
     except Exception as e:
-        print(f"[ERROR] Model: {e}")
+        print(f"[ERROR] Model load failed: {e}")
+        # 尝试探测 Ollama
+        try:
+            import requests
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                models = [m['name'] for m in resp.json().get('models', [])]
+                if len(models) > 0:
+                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
+                    return "ollama", target_model, "localhost (Ollama API)"
+        except:
+            pass
         return None, None, None
 
     try:
@@ -169,14 +216,49 @@ def load_model_cached(_base_model_path, _lora_path):
     return model, tokenizer, device
 
 
-def generate_response(model, tokenizer, device, user_input, history=None, max_new_tokens=512):
-    """使用Qwen模型生成心理健康回复"""
+def generate_response_stream(model, tokenizer, device, user_input, history=None, max_new_tokens=512):
+    """使用Qwen模型或Ollama流式生成心理健康回复"""
     if history is None:
         history = []
     
     # 添加 system prompt 引导模型提供更实用的建议
-    system_prompt = "你是一个正常的聊天机器人。回复要简短、直接。不要问用户有什么烦恼，不要假设用户心情不好，不要说'理解你的感受'之类的套话。就像微信聊天一样自然。"
+    system_prompt = "你是一个充满同理心且专业的心理健康助手。回复要简短、温暖、真诚，并且尽可能提供有建设性的帮助，就像微信聊天一样自然。"
     
+    # 处理 Ollama 模型的逻辑
+    if model == "ollama":
+        import requests
+        import json
+        url = "http://localhost:11434/api/chat"
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": user_input})
+        
+        payload = {
+            "model": tokenizer,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": 0.6,
+                "top_p": 0.85
+            }
+        }
+        try:
+            resp = requests.post(url, json=payload, stream=True, timeout=60)
+            if resp.status_code == 200:
+                for line in resp.iter_lines():
+                    if line:
+                        data = json.loads(line)
+                        chunk = data.get("message", {}).get("content", "")
+                        if chunk:
+                            yield chunk
+            else:
+                yield f"Ollama 服务返回错误代码: {resp.status_code}"
+        except Exception as e:
+            yield f"连接 Ollama 失败，请检查服务是否运行正常: {e}"
+        return
+
+    # 处理传统 HuggingFace Qwen 模型的逻辑
     conversation = [{"role": "system", "content": system_prompt}]
     conversation.extend(history)
     conversation.append({"role": "user", "content": user_input})
@@ -190,30 +272,31 @@ def generate_response(model, tokenizer, device, user_input, history=None, max_ne
         inputs = tokenizer([text], return_tensors="pt").to(model.device)
     except Exception as e:
         print(f"[ERROR] Tokenization failed: {e}")
-        return "抱歉，我无法处理这个输入。请尝试重新提问。"
+        yield "抱歉，我无法处理这个输入。请尝试重新提问。"
+        return
+    
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    generation_kwargs = dict(
+        input_ids=inputs.input_ids,
+        attention_mask=inputs.attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.5,
+        top_p=0.85,
+        repetition_penalty=1.2,
+        pad_token_id=tokenizer.eos_token_id,
+        streamer=streamer
+    )
     
     try:
-        with torch.no_grad():
-            generated_ids = model.generate(
-                inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.5,
-                top_p=0.85,
-                repetition_penalty=1.2,
-                pad_token_id=tokenizer.eos_token_id
-            )
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
         
-        response = tokenizer.decode(
-            generated_ids[0][len(inputs.input_ids[0]):],
-            skip_special_tokens=True
-        )
-        
-        return response if response.strip() else "抱歉，我无法生成回复。请尝试换个方式提问。"
+        for new_text in streamer:
+            yield new_text
     except Exception as e:
         print(f"[ERROR] Generation failed: {e}")
-        return "抱歉，生成回复时出错。请尝试重新提问。"
+        yield "抱歉，生成回复时出错。请尝试重新提问。"
 
 
 def main():
@@ -402,21 +485,21 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("正在思考..."):
                 if model is not None:
-                    # 使用真实模型
-                    response = generate_response(
+                    # 使用真实模型，改为流式输出
+                    response_gen = generate_response_stream(
                         model, tokenizer, device,
                         prompt,
                         history=st.session_state.history,
-                        max_new_tokens=200  # 减少输出长度，避免生成过长无意义内容
+                        max_new_tokens=200
                     )
+                    response = st.write_stream(response_gen)
                     # 更新历史
                     st.session_state.history.append({"role": "user", "content": prompt})
                     st.session_state.history.append({"role": "assistant", "content": response})
                 else:
                     # 使用模拟回复
                     response = simulate_mental_health_response(prompt, history=st.session_state.history)
-                
-                st.markdown(response)
+                    st.markdown(response)
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()
