@@ -100,7 +100,7 @@ def display_crisis_banner():
 
 @st.cache_resource(max_entries=1, ttl=3600, show_spinner=False)
 def load_model_cached(_base_model_path, _lora_path):
-    """加载Qwen-1.8B心理健康模型 + LoRA微调权重（若失败则尝试探测并降级到 Ollama）"""
+    """加载Qwen-1.8B心理健康模型 + LoRA微调权重"""
     import locale
     import psutil
     if hasattr(locale, 'setlocale'):
@@ -111,37 +111,14 @@ def load_model_cached(_base_model_path, _lora_path):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 如果 _base_model_path 不存在，尝试探测本地 Ollama
+    # 如果 _base_model_path 不存在，直接返回
     if not _base_model_path or not os.path.exists(_base_model_path):
         print(f"[INFO] Base model path not found: {_base_model_path}")
-        print("[INFO] Falling back to check Ollama service...")
-        try:
-            import requests
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            if resp.status_code == 200:
-                models = [m['name'] for m in resp.json().get('models', [])]
-                if "gemma4:e2b" in models or len(models) > 0:
-                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
-                    print(f"[OK] Ollama detected. Using model: {target_model}")
-                    return "ollama", target_model, "localhost (Ollama API)"
-        except Exception as e:
-            print(f"[INFO] Ollama connection failed: {e}")
         return None, None, "not_found"
 
     available_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
     if device == 'cpu' and available_mem_gb < 4:
         print(f"[WARNING] Available RAM only {available_mem_gb:.1f}GB")
-        # 内存不足也尝试探测下 Ollama
-        try:
-            import requests
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            if resp.status_code == 200:
-                models = [m['name'] for m in resp.json().get('models', [])]
-                if len(models) > 0:
-                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
-                    return "ollama", target_model, "localhost (Ollama API)"
-        except:
-            pass
         return None, None, "low_memory"
 
     # 确定 LoRA 路径
@@ -157,17 +134,6 @@ def load_model_cached(_base_model_path, _lora_path):
         print(f"[OK] Tokenizer loaded")
     except Exception as e:
         print(f"[ERROR] Tokenizer failed: {e}")
-        # 尝试探测 Ollama
-        try:
-            import requests
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            if resp.status_code == 200:
-                models = [m['name'] for m in resp.json().get('models', [])]
-                if len(models) > 0:
-                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
-                    return "ollama", target_model, "localhost (Ollama API)"
-        except:
-            pass
         return None, None, None
 
     try:
@@ -191,17 +157,6 @@ def load_model_cached(_base_model_path, _lora_path):
         print(f"[OK] Qwen-1.8B model loaded on {device}")
     except Exception as e:
         print(f"[ERROR] Model load failed: {e}")
-        # 尝试探测 Ollama
-        try:
-            import requests
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            if resp.status_code == 200:
-                models = [m['name'] for m in resp.json().get('models', [])]
-                if len(models) > 0:
-                    target_model = "gemma4:e2b" if "gemma4:e2b" in models else models[0]
-                    return "ollama", target_model, "localhost (Ollama API)"
-        except:
-            pass
         return None, None, None
 
     try:
@@ -217,46 +172,12 @@ def load_model_cached(_base_model_path, _lora_path):
 
 
 def generate_response_stream(model, tokenizer, device, user_input, history=None, max_new_tokens=512):
-    """使用Qwen模型或Ollama流式生成心理健康回复"""
+    """使用Qwen模型流式生成心理健康回复"""
     if history is None:
         history = []
     
     # 添加 system prompt 引导模型提供更实用的建议
     system_prompt = "你是一个充满同理心且专业的心理健康助手。回复要简短、温暖、真诚，并且尽可能提供有建设性的帮助，就像微信聊天一样自然。"
-    
-    # 处理 Ollama 模型的逻辑
-    if model == "ollama":
-        import requests
-        import json
-        url = "http://localhost:11434/api/chat"
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-        messages.append({"role": "user", "content": user_input})
-        
-        payload = {
-            "model": tokenizer,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "temperature": 0.6,
-                "top_p": 0.85
-            }
-        }
-        try:
-            resp = requests.post(url, json=payload, stream=True, timeout=60)
-            if resp.status_code == 200:
-                for line in resp.iter_lines():
-                    if line:
-                        data = json.loads(line)
-                        chunk = data.get("message", {}).get("content", "")
-                        if chunk:
-                            yield chunk
-            else:
-                yield f"Ollama 服务返回错误代码: {resp.status_code}"
-        except Exception as e:
-            yield f"连接 Ollama 失败，请检查服务是否运行正常: {e}"
-        return
 
     # 处理传统 HuggingFace Qwen 模型的逻辑
     conversation = [{"role": "system", "content": system_prompt}]
@@ -497,9 +418,9 @@ def main():
                     st.session_state.history.append({"role": "user", "content": prompt})
                     st.session_state.history.append({"role": "assistant", "content": response})
                 else:
-                    # 使用模拟回复
-                    response = simulate_mental_health_response(prompt, history=st.session_state.history)
-                    st.markdown(response)
+                    # 使用模拟回复（打字机流式效果）
+                    response_gen = simulate_mental_health_response_stream(prompt, history=st.session_state.history)
+                    response = st.write_stream(response_gen)
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()
@@ -582,6 +503,18 @@ def simulate_mental_health_response(user_input, history=None):
         "我理解。有时候把话说出来，心里就会轻松一些。",
     ]
     return random.choice(default_responses)
+
+
+def simulate_mental_health_response_stream(user_input, history=None):
+    """
+    将模拟回复转化为流式生成器，提供更好的打字机效果体验
+    """
+    import time
+    response_text = simulate_mental_health_response(user_input, history)
+    for i in range(0, len(response_text), 2):
+        yield response_text[i:i+2]
+        time.sleep(0.02)
+
 
 if __name__ == "__main__":
     main()
